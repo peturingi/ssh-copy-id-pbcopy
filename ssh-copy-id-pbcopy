@@ -1,0 +1,90 @@
+#!/bin/sh
+set -eu
+
+# We install as `ssh-copy-id`, shadowing the real one on PATH, so we have to
+# locate the real binary explicitly instead of calling ourselves recursively.
+real=
+for cand in /usr/bin/ssh-copy-id /bin/ssh-copy-id /usr/local/bin/ssh-copy-id /opt/homebrew/bin/ssh-copy-id; do
+    [ -x "$cand" ] || continue
+    [ "$cand" = "$(command -v "$0" 2>/dev/null)" ] && continue
+    real=$cand
+    break
+done
+if [ -z "$real" ]; then
+    echo "ERROR: cannot find the real ssh-copy-id in /usr/bin, /bin, /usr/local/bin, /opt/homebrew/bin." >&2
+    exit 1
+fi
+
+if ! "$real" "$@"; then
+    rc=$?
+    echo "INFO: ssh-copy-id exited with status $rc — skipping pbcopy install." >&2
+    exit "$rc"
+fi
+
+if [ "$(id -u)" = 0 ]; then
+    echo "INFO: skipping pbcopy install on remote because ssh-copy-id was run as root." >&2
+    echo "      Re-run as your normal user to install pbcopy on the remote." >&2
+    exit 0
+fi
+
+# Last arg is the [user@]host target (same convention ssh-copy-id uses).
+target=$(eval printf '%s' "\${$#}")
+
+printf 'Also install pbcopy (OSC 52) on %s? [Y/n]: ' "$target"
+read ans
+case "$ans" in
+    n|N|no|NO) echo "Skipped pbcopy install."; exit 0 ;;
+esac
+
+ssh "$target" 'sh -s' <<'REMOTE'
+set -u
+
+bindir="$HOME/.local/bin"
+pbcopy="$bindir/pbcopy"
+
+if ! mkdir -p "$bindir" 2>/dev/null; then
+    echo "WARN: cannot create $bindir — skipping pbcopy install." >&2
+    exit 0
+fi
+if [ ! -w "$bindir" ]; then
+    echo "WARN: $bindir is not writable — skipping pbcopy install." >&2
+    exit 0
+fi
+
+if ! cat > "$pbcopy" <<'PB'
+#!/bin/sh
+# pbcopy — OSC 52 clipboard shim.
+# Installed by ssh-copy-id-pbcopy — https://github.com/peturingi/ssh-copy-id-pbcopy
+# Pipe text in; it lands on the clipboard of the local terminal emulator.
+printf '\033]52;c;%s\033\\' "$(base64 | tr -d '\n')"
+PB
+then
+    echo "WARN: failed to write $pbcopy — skipping." >&2
+    exit 0
+fi
+chmod +x "$pbcopy" 2>/dev/null || \
+    echo "WARN: could not chmod +x $pbcopy." >&2
+
+case ":$PATH:" in
+    *":$bindir:"*)
+        exit 0 ;;
+esac
+
+profile="$HOME/.profile"
+if [ -e "$profile" ] && [ ! -w "$profile" ]; then
+    echo "WARN: $profile is not writable — add this to your shell rc manually:" >&2
+    echo '    if [ -d "$HOME/.local/bin" ] ; then PATH="$HOME/.local/bin:$PATH" ; fi' >&2
+    exit 0
+fi
+if [ ! -e "$profile" ] && ! touch "$profile" 2>/dev/null; then
+    echo "WARN: cannot create $profile — add .local/bin to PATH manually." >&2
+    exit 0
+fi
+
+if ! grep -q '\.local/bin' "$profile" 2>/dev/null; then
+    if ! printf '\n# added by ssh-copy-id-pbcopy\nif [ -d "$HOME/.local/bin" ] ; then PATH="$HOME/.local/bin:$PATH" ; fi\n' \
+            >> "$profile" 2>/dev/null; then
+        echo "WARN: failed to append PATH line to $profile." >&2
+    fi
+fi
+REMOTE
